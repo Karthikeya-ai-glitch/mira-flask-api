@@ -2,9 +2,9 @@ flaml[automl]
 flask
 flask-cors
 pandas
-numpy<2.0.0
+numpy
 joblib
-scikit-learn==1.4.0
+scikit-learn
 sentence-transformers
 openpyxl
 gunicorn
