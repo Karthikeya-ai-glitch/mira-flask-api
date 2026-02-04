@@ -1,11 +1,10 @@
-flaml[automl]
 flask
 flask-cors
 pandas
 numpy
 joblib
 scikit-learn
-sentence-transformers
 openpyxl
 gunicorn
 tqdm
+google-genai
