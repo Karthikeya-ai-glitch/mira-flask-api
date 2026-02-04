@@ -3,6 +3,7 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
+import os
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -33,13 +34,19 @@ def price_to_number(x):
 property_df["Price"] = property_df["Price"].apply(price_to_number)
 
 # =====================================================
-# LOAD TEXT MODEL + EMBEDDINGS
+# LAZY LOAD TEXT MODEL (CRITICAL FOR RENDER)
 # =====================================================
-text_model = SentenceTransformer("all-mpnet-base-v2")
-property_embeddings = text_model.encode(
-    property_df["Qualitative Description"].tolist(),
-    normalize_embeddings=True
-)
+text_model = None
+property_embeddings = None
+
+def load_text_model():
+    global text_model, property_embeddings
+    if text_model is None:
+        text_model = SentenceTransformer("all-mpnet-base-v2")
+        property_embeddings = text_model.encode(
+            property_df["Qualitative Description"].tolist(),
+            normalize_embeddings=True
+        )
 
 # =====================================================
 # PRICE PREDICTION API
@@ -50,19 +57,26 @@ def predict_price():
         data = request.get_json()
         df = pd.DataFrame([data])
 
+        # Drop ID column if sent
         if "Property ID" in df.columns:
             df = df.drop(columns=["Property ID"])
 
+        # Convert Date Sold to datetime (same as training)
         if "Date Sold" in df.columns:
             df["Date Sold"] = pd.to_datetime(df["Date Sold"])
 
+        # Encode categorical columns
         cat_cols = ["Location", "Condition", "Type"]
         df[cat_cols] = encoder.transform(df[cat_cols])
 
+        # Align features exactly
         df = df.reindex(columns=model_features)
+
         prediction = price_model.predict(df)[0]
 
-        return jsonify({"predicted_price": round(float(prediction), 2)})
+        return jsonify({
+            "predicted_price": round(float(prediction), 2)
+        })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -109,44 +123,54 @@ def final_match_score(user, user_embedding, idx, priority_order):
 # =====================================================
 @app.route("/match", methods=["POST"])
 def match_properties():
-    payload = request.get_json()
+    try:
+        payload = request.get_json()
 
-    required_fields = ["budget", "bedrooms", "bathrooms", "qualitative_description"]
-    for field in required_fields:
-        if field not in payload:
-            return jsonify({"error": f"Missing field: {field}"}), 400
+        required_fields = ["budget", "bedrooms", "bathrooms", "qualitative_description"]
+        for field in required_fields:
+            if field not in payload:
+                return jsonify({"error": f"Missing field: {field}"}), 400
 
-    priority_order = payload.get(
-        "priority_order",
-        ["bedrooms", "price", "bathrooms", "quality_description"]
-    )
+        priority_order = payload.get(
+            "priority_order",
+            ["bedrooms", "price", "bathrooms", "quality_description"]
+        )
 
-    if set(priority_order) != {"bedrooms", "price", "bathrooms", "quality_description"}:
-        return jsonify({"error": "Invalid priority order"}), 400
+        if set(priority_order) != {
+            "bedrooms", "price", "bathrooms", "quality_description"
+        }:
+            return jsonify({"error": "Invalid priority order"}), 400
 
-    user = {
-        "budget": float(payload["budget"]),
-        "bedrooms": int(payload["bedrooms"]),
-        "bathrooms": int(payload["bathrooms"])
-    }
+        # Lazy load heavy model only when needed
+        load_text_model()
 
-    user_embedding = text_model.encode(
-        payload["qualitative_description"],
-        normalize_embeddings=True
-    )
+        user = {
+            "budget": float(payload["budget"]),
+            "bedrooms": int(payload["bedrooms"]),
+            "bathrooms": int(payload["bathrooms"])
+        }
 
-    results = []
-    for i in range(len(property_df)):
-        score = final_match_score(user, user_embedding, i, priority_order)
-        row = property_df.iloc[i].to_dict()
-        row["Match_Score"] = score
-        results.append(row)
+        user_embedding = text_model.encode(
+            payload["qualitative_description"],
+            normalize_embeddings=True
+        )
 
-    results = sorted(results, key=lambda x: x["Match_Score"], reverse=True)
-    return jsonify(results[:5])
+        results = []
+        for i in range(len(property_df)):
+            score = final_match_score(user, user_embedding, i, priority_order)
+            row = property_df.iloc[i].to_dict()
+            row["Match_Score"] = score
+            results.append(row)
+
+        results = sorted(results, key=lambda x: x["Match_Score"], reverse=True)
+        return jsonify(results[:5])
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 # =====================================================
-# RUN APP
+# RUN APP (RENDER SAFE)
 # =====================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
