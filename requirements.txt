@@ -1,3 +1,4 @@
+flaml[automl]
 flask
 flask-cors
 pandas
