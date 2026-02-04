@@ -1,0 +1,15 @@
+tqdm
+flaml[automl]
+matplotlib
+joblib
+flask
+flask-cors
+pandas
+numpy 
+scikit-learn
+sentence-transformers
+huggingface-hub
+transformers
+torch
+gunicorn
+openpyxl
