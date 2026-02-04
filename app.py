@@ -5,20 +5,23 @@ import numpy as np
 import joblib
 import os
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 app = Flask(__name__)
 CORS(app)
 
 # =====================================================
-# LOAD PRICE PREDICTION MODEL
+# LOAD LIGHTWEIGHT MODELS
 # =====================================================
+# Pre-loading smaller models to stay under 512MB
 price_model = joblib.load("price_model.pkl")
 model_features = joblib.load("model_features.pkl")
 encoder = joblib.load("ordinal_encoder.pkl")
 
+# Use MiniLM (80MB) instead of MPNet (420MB)
+text_model = SentenceTransformer("all-MiniLM-L6-v2")
+
 # =====================================================
-# LOAD PROPERTY DATA FOR MATCHING
+# LOAD & PRE-PROCESS DATA
 # =====================================================
 property_df = pd.read_excel("Case Study 2 Data.xlsx", sheet_name="Property Data")
 property_df = property_df.dropna().reset_index(drop=True)
@@ -33,144 +36,86 @@ def price_to_number(x):
 
 property_df["Price"] = property_df["Price"].apply(price_to_number)
 
-# =====================================================
-# LAZY LOAD TEXT MODEL (CRITICAL FOR RENDER)
-# =====================================================
-text_model = None
-property_embeddings = None
-
-def load_text_model():
-    global text_model, property_embeddings
-    if text_model is None:
-        text_model = SentenceTransformer("all-mpnet-base-v2")
-        property_embeddings = text_model.encode(
-            property_df["Qualitative Description"].tolist(),
-            normalize_embeddings=True
-        )
+# Pre-calculate embeddings once at startup to save time during requests
+# This fits in memory with MiniLM, but NOT with MPNet
+property_embeddings = text_model.encode(
+    property_df["Qualitative Description"].tolist(),
+    normalize_embeddings=True,
+    convert_to_numpy=True
+)
 
 # =====================================================
-# PRICE PREDICTION API
+# HELPERS
+# =====================================================
+def soft_score(diff, tolerance):
+    return np.exp(-diff / tolerance)
+
+def get_weights_from_priority(priority_order):
+    base_weights = [0.40, 0.30, 0.20, 0.10]
+    return {priority_order[i]: base_weights[i] for i in range(4)}
+
+# =====================================================
+# API ENDPOINTS
 # =====================================================
 @app.route("/predict", methods=["POST"])
 def predict_price():
     try:
         data = request.get_json()
         df = pd.DataFrame([data])
-
-        # Drop ID column if sent
         if "Property ID" in df.columns:
             df = df.drop(columns=["Property ID"])
-
-        # Convert Date Sold to datetime (same as training)
         if "Date Sold" in df.columns:
             df["Date Sold"] = pd.to_datetime(df["Date Sold"])
-
-        # Encode categorical columns
-        cat_cols = ["Location", "Condition", "Type"]
-        df[cat_cols] = encoder.transform(df[cat_cols])
-
-        # Align features exactly
+        
+        # Encode and Align
+        df[ ["Location", "Condition", "Type"] ] = encoder.transform(df[["Location", "Condition", "Type"]])
         df = df.reindex(columns=model_features)
-
+        
         prediction = price_model.predict(df)[0]
-
-        return jsonify({
-            "predicted_price": round(float(prediction), 2)
-        })
-
+        return jsonify({"predicted_price": round(float(prediction), 2)})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# =====================================================
-# MATCHING HELPERS
-# =====================================================
-def soft_score(diff, tolerance):
-    return np.exp(-diff / tolerance)
-
-def numeric_scores(user, prop):
-    bed = soft_score(abs(user["bedrooms"] - prop["Bedrooms"]), 1)
-    bath = soft_score(abs(user["bathrooms"] - prop["Bathrooms"]), 1)
-    price = soft_score(abs(user["budget"] - prop["Price"]), 0.1 * user["budget"])
-    return bed, bath, price
-
-def text_similarity(user_embedding, idx):
-    return cosine_similarity(
-        user_embedding.reshape(1, -1),
-        property_embeddings[idx].reshape(1, -1)
-    )[0][0]
-
-def get_weights_from_priority(priority_order):
-    base_weights = [0.40, 0.30, 0.20, 0.10]
-    return {priority_order[i]: base_weights[i] for i in range(4)}
-
-def final_match_score(user, user_embedding, idx, priority_order):
-    weights = get_weights_from_priority(priority_order)
-
-    bed, bath, price = numeric_scores(user, property_df.iloc[idx])
-    text = text_similarity(user_embedding, idx)
-
-    score = (
-        weights["bedrooms"] * bed +
-        weights["price"] * price +
-        weights["bathrooms"] * bath +
-        weights["quality_description"] * text
-    )
-
-    return round(score * 100, 2)
-
-# =====================================================
-# MATCHING API (WITH PRIORITY ORDER)
-# =====================================================
 @app.route("/match", methods=["POST"])
 def match_properties():
     try:
         payload = request.get_json()
+        priority_order = payload.get("priority_order", ["bedrooms", "price", "bathrooms", "quality_description"])
+        weights = get_weights_from_priority(priority_order)
 
-        required_fields = ["budget", "bedrooms", "bathrooms", "qualitative_description"]
-        for field in required_fields:
-            if field not in payload:
-                return jsonify({"error": f"Missing field: {field}"}), 400
+        # 1. Encode user description
+        user_emb = text_model.encode(payload["qualitative_description"], normalize_embeddings=True)
 
-        priority_order = payload.get(
-            "priority_order",
-            ["bedrooms", "price", "bathrooms", "quality_description"]
-        )
+        # 2. Vectorized Text Similarity (Much faster/lighter than a loop)
+        # Cosine similarity on normalized vectors is just the dot product
+        text_sims = np.dot(property_embeddings, user_emb)
 
-        if set(priority_order) != {
-            "bedrooms", "price", "bathrooms", "quality_description"
-        }:
-            return jsonify({"error": "Invalid priority order"}), 400
+        # 3. Vectorized Numeric Scoring
+        bed_diffs = np.abs(int(payload["bedrooms"]) - property_df["Bedrooms"].values)
+        bath_diffs = np.abs(int(payload["bathrooms"]) - property_df["Bathrooms"].values)
+        price_diffs = np.abs(float(payload["budget"]) - property_df["Price"].values)
 
-        # Lazy load heavy model only when needed
-        load_text_model()
+        bed_scores = np.exp(-bed_diffs / 1)
+        bath_scores = np.exp(-bath_diffs / 1)
+        price_scores = np.exp(-price_diffs / (0.1 * float(payload["budget"])))
 
-        user = {
-            "budget": float(payload["budget"]),
-            "bedrooms": int(payload["bedrooms"]),
-            "bathrooms": int(payload["bathrooms"])
-        }
+        # 4. Final Weighted Score
+        final_scores = (
+            weights["bedrooms"] * bed_scores +
+            weights["price"] * price_scores +
+            weights["bathrooms"] * bath_scores +
+            weights["quality_description"] * text_sims
+        ) * 100
 
-        user_embedding = text_model.encode(
-            payload["qualitative_description"],
-            normalize_embeddings=True
-        )
-
-        results = []
-        for i in range(len(property_df)):
-            score = final_match_score(user, user_embedding, i, priority_order)
-            row = property_df.iloc[i].to_dict()
-            row["Match_Score"] = score
-            results.append(row)
-
-        results = sorted(results, key=lambda x: x["Match_Score"], reverse=True)
-        return jsonify(results[:5])
-
+        # 5. Format results
+        property_df["Match_Score"] = np.round(final_scores, 2)
+        top_5 = property_df.sort_values(by="Match_Score", ascending=False).head(5)
+        
+        return jsonify(top_5.to_dict(orient="records"))
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# =====================================================
-# RUN APP (RENDER SAFE)
-# =====================================================
 if __name__ == "__main__":
+    # Render uses the PORT env var
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
