@@ -4,6 +4,16 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import platform
+
+# =====================================================
+# PLATFORM CHECK (FAISS SAFE)
+# =====================================================
+USE_FAISS = platform.system() == "Linux"
+
+if USE_FAISS:
+    import faiss
+
 from google import genai
 from google.genai import types
 
@@ -21,11 +31,12 @@ model_features = None
 encoder = None
 property_df = None
 property_embeddings = None
+faiss_index = None
 
 # =====================================================
 # GEMINI CONFIG
 # =====================================================
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = "AIzaSyCxdmJaqvlJ4VqCCQ4fkFdoGzUO2inTC1g"
 client = genai.Client(api_key=API_KEY)
 
 # =====================================================
@@ -46,42 +57,37 @@ def get_gemini_embedding(text, task_type):
             contents=text,
             config=types.EmbedContentConfig(task_type=task_type)
         )
-        return np.array(result.embeddings[0].values, dtype=np.float32)
-    except Exception as e:
-        print("Embedding error:", e)
-        return np.zeros(768, dtype=np.float32)
+        return np.array(
+            result.embeddings[0].values,
+            dtype=np.float16
+        )
+    except Exception:
+        return np.zeros(768, dtype=np.float16)
 
 # =====================================================
-# LAZY RESOURCE LOADER (CRITICAL FOR RENDER)
+# LAZY RESOURCE LOADER
 # =====================================================
 def load_resources():
     global price_model, model_features, encoder
-    global property_df, property_embeddings
+    global property_df, property_embeddings, faiss_index
 
     if price_model is None:
-        print("Loading ML models...")
         price_model = joblib.load("price_model.pkl")
         model_features = joblib.load("model_features.pkl")
         encoder = joblib.load("ordinal_encoder.pkl")
 
     if property_df is None:
-        print("Loading property data...")
-        property_df = (
-            pd.read_excel("Case Study 2 Data.xlsx", sheet_name="Property Data")
-            .dropna()
-            .reset_index(drop=True)
-        )
+        property_df = pd.read_csv("property_data.csv")
         property_df["Price"] = property_df["Price"].apply(price_to_number)
 
     if property_embeddings is None:
-        print("Generating property embeddings (lazy)...")
-        property_embeddings = np.array(
-            [
-                get_gemini_embedding(desc, "RETRIEVAL_DOCUMENT")
-                for desc in property_df["Qualitative Description"].tolist()
-            ],
-            dtype=np.float32
+        property_embeddings = np.load(
+            "property_embeddings.npy",
+            mmap_mode="r"
         )
+
+    if USE_FAISS and faiss_index is None:
+        faiss_index = faiss.read_index("faiss.index")
 
 # =====================================================
 # ROUTES
@@ -119,17 +125,47 @@ def match_properties():
 
         payload = request.get_json()
 
+        # -------------------------------------------------
+        # USER EMBEDDING
+        # -------------------------------------------------
         user_embedding = get_gemini_embedding(
             payload["qualitative_description"],
             "RETRIEVAL_QUERY"
-        )
+        ).astype("float32").reshape(1, -1)
 
-        text_sims = np.dot(property_embeddings, user_embedding)
+        # -------------------------------------------------
+        # SEMANTIC SEARCH (FAISS OR FALLBACK)
+        # -------------------------------------------------
+        if USE_FAISS:
+            K = 50
+            sims, idxs = faiss_index.search(user_embedding, K)
+            candidate_df = property_df.iloc[idxs[0]].reset_index(drop=True)
+            semantic_scores = sims[0]
+        else:
+            semantic_scores = np.dot(
+                property_embeddings,
+                user_embedding.T
+            ).ravel()
+            top_idx = np.argsort(semantic_scores)[-50:]
+            candidate_df = property_df.iloc[top_idx].reset_index(drop=True)
+            semantic_scores = semantic_scores[top_idx]
 
+        # -------------------------------------------------
+        # NUMERIC SIMILARITY
+        # -------------------------------------------------
         budget = float(payload["budget"])
         beds = int(payload["bedrooms"])
         baths = int(payload["bathrooms"])
 
+        bed_scores = np.exp(-np.abs(beds - candidate_df["Bedrooms"].values))
+        bath_scores = np.exp(-np.abs(baths - candidate_df["Bathrooms"].values))
+        price_scores = np.exp(
+            -np.abs(budget - candidate_df["Price"].values) / (0.1 * budget)
+        )
+
+        # -------------------------------------------------
+        # PRIORITY-BASED WEIGHTING
+        # -------------------------------------------------
         priority_order = payload.get(
             "priority_order",
             ["bedrooms", "price", "bathrooms", "quality_description"]
@@ -138,26 +174,20 @@ def match_properties():
         weights = [0.4, 0.3, 0.2, 0.1]
         weight_map = dict(zip(priority_order, weights))
 
-        bed_scores = np.exp(-np.abs(beds - property_df["Bedrooms"].values))
-        bath_scores = np.exp(-np.abs(baths - property_df["Bathrooms"].values))
-        price_scores = np.exp(
-            -np.abs(budget - property_df["Price"].values) / (0.1 * budget)
-        )
-
         final_scores = (
             weight_map["bedrooms"] * bed_scores +
             weight_map["price"] * price_scores +
             weight_map["bathrooms"] * bath_scores +
-            weight_map["quality_description"] * text_sims
+            weight_map["quality_description"] * semantic_scores
         ) * 100
 
-        property_df["Match_Score"] = np.round(final_scores, 2)
+        # -------------------------------------------------
+        # TOP-5 RESULTS
+        # -------------------------------------------------
+        top_idx = np.argsort(final_scores)[-5:][::-1]
 
-        top_5 = (
-            property_df
-            .sort_values(by="Match_Score", ascending=False)
-            .head(5)
-        )
+        top_5 = candidate_df.iloc[top_idx].copy()
+        top_5["Match_Score"] = np.round(final_scores[top_idx], 2)
 
         return jsonify(top_5.to_dict(orient="records"))
 
@@ -165,7 +195,7 @@ def match_properties():
         return jsonify({"error": str(e)}), 400
 
 # =====================================================
-# ENTRYPOINT (RENDER NEEDS THIS)
+# ENTRYPOINT
 # =====================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
