@@ -100,15 +100,37 @@ def predict_price():
         data = request.get_json()
         df = pd.DataFrame([data])
 
+        # -------------------------------------------------
+        # DROP NON-INFERENCE COLUMNS
+        # -------------------------------------------------
         if "Property ID" in df.columns:
             df = df.drop(columns=["Property ID"])
 
+        # -------------------------------------------------
+        # HANDLE DATE SOLD (ENGINEER FEATURES)
+        # -------------------------------------------------
         if "Date Sold" in df.columns:
             df["Date Sold"] = pd.to_datetime(df["Date Sold"])
 
+            df["Sold_Year"] = df["Date Sold"].dt.year
+            df["Sold_Month"] = df["Date Sold"].dt.month
+            df["Sold_Quarter"] = df["Date Sold"].dt.quarter
+
+            # Property age at time of sale
+            if "Year Built" in df.columns:
+                df["Property_Age_At_Sale"] = df["Sold_Year"] - df["Year Built"]
+
+            df = df.drop(columns=["Date Sold"])
+
+        # -------------------------------------------------
+        # ENCODE CATEGORICAL FEATURES
+        # -------------------------------------------------
         cat_cols = ["Location", "Condition", "Type"]
         df[cat_cols] = encoder.transform(df[cat_cols])
 
+        # -------------------------------------------------
+        # ALIGN FEATURES WITH TRAINING
+        # -------------------------------------------------
         df = df.reindex(columns=model_features)
 
         prediction = price_model.predict(df)[0]
@@ -116,6 +138,7 @@ def predict_price():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
 
 
 @app.route("/match", methods=["POST"])
