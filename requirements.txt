@@ -5,7 +5,7 @@ pandas
 numpy==1.26.4
 faiss-cpu
 joblib
-scikit-learn
+scikit-learn==1.7.2
 openpyxl
 gunicorn
 tqdm
