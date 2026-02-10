@@ -36,7 +36,7 @@ faiss_index = None
 # =====================================================
 # GEMINI CONFIG
 # =====================================================
-API_KEY = "AIzaSyCxdmJaqvlJ4VqCCQ4fkFdoGzUO2inTC1g"
+API_KEY = "AIzaSyANv7Wr-XdF_zuzZnalr-PYv0ZQtQyi0WE"
 client = genai.Client(api_key=API_KEY)
 
 # =====================================================
